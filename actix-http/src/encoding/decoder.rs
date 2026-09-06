@@ -300,3 +300,90 @@ impl ContentDecoder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use bytes::BytesMut;
+    use futures_util::{stream, StreamExt as _};
+
+    use super::*;
+
+    #[actix_rt::test]
+    async fn identity_decode() {
+        let raw = Bytes::from_static(b"plain raw payload without compression");
+        let payload_stream = stream::iter(vec![Ok(raw.clone())]);
+        let mut decoder = Decoder::new(payload_stream, ContentEncoding::Identity);
+
+        let mut out = BytesMut::new();
+        while let Some(chunk) = decoder.next().await {
+            out.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(out.freeze(), raw);
+    }
+
+    #[cfg(feature = "compress-brotli")]
+    #[actix_rt::test]
+    async fn brotli_decode_various_sizes() {
+        for size in [256, 8096, 8192, 16384, 32768] {
+            let original = vec![b'x'; size];
+            let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 3, 22);
+            encoder.write_all(&original).unwrap();
+            encoder.flush().unwrap();
+            let compressed = encoder.into_inner();
+
+            let payload_stream = stream::iter(vec![Ok(Bytes::from(compressed))]);
+            let mut decoder = Decoder::new(payload_stream, ContentEncoding::Brotli);
+
+            let mut decompressed = BytesMut::new();
+            while let Some(chunk) = decoder.next().await {
+                decompressed.extend_from_slice(&chunk.unwrap());
+            }
+
+            assert_eq!(decompressed.as_ref(), original.as_slice());
+        }
+    }
+
+    #[cfg(feature = "compress-brotli")]
+    #[actix_rt::test]
+    async fn brotli_decode_chunked() {
+        let original = (0..20_000).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
+        let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 3, 22);
+        encoder.write_all(&original).unwrap();
+        encoder.flush().unwrap();
+        let compressed = encoder.into_inner();
+
+        let chunks: Vec<Result<Bytes, PayloadError>> = compressed
+            .chunks(64)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+
+        let payload_stream = stream::iter(chunks);
+        let mut decoder = Decoder::new(payload_stream, ContentEncoding::Brotli);
+
+        let mut decompressed = BytesMut::new();
+        while let Some(chunk) = decoder.next().await {
+            decompressed.extend_from_slice(&chunk.unwrap());
+        }
+
+        assert_eq!(decompressed.as_ref(), original.as_slice());
+    }
+
+    #[cfg(feature = "compress-brotli")]
+    #[actix_rt::test]
+    async fn brotli_corrupted_data() {
+        let bad_data = vec![Ok(Bytes::from_static(b"corrupted brotli stream content"))];
+        let payload_stream = stream::iter(bad_data);
+        let mut decoder = Decoder::new(payload_stream, ContentEncoding::Brotli);
+
+        let mut failed = false;
+        while let Some(chunk) = decoder.next().await {
+            if chunk.is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "expected error on corrupted brotli payload");
+    }
+}
